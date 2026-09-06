@@ -88,6 +88,16 @@ is_blocked(self)
     OUTPUT:
         RETVAL
 
+int
+_settles(tag, delivery_tag, multiple)
+    UV tag
+    UV delivery_tag
+    int multiple
+    CODE:
+        RETVAL = rmqc_settles((uint64_t) tag, (uint64_t) delivery_tag, multiple);
+    OUTPUT:
+        RETVAL
+
 void
 _send_ack(self, args_ref)
     RabbitMQ::Connection self

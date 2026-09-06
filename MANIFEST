@@ -11,6 +11,7 @@ t/12-confirm-nack.t
 t/13-confirm-unknown.t
 t/14-exclusion.t
 t/15-nonexistent-exchange.t
+t/16-settlement-predicate.t
 t/lib/RmqcTest.pm
 typemap
 utils.c

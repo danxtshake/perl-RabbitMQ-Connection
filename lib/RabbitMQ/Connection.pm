@@ -93,10 +93,18 @@ Issues C<confirm.select> on the channel (opening it if needed). From then on
 C<send> on that channel blocks until the publication is settled. Confirm
 sequence numbers are kept per channel, starting at 1 after C<confirm_select>.
 
-Confirm mode is only allowed on a B<publish-only connection>: C<confirm_select>
-croaks if the connection has consumed, and C<consume> croaks once any channel
-is in confirm mode. This keeps settlement frames from ever interleaving with
-deliveries, which is what lets the settlement loop stay one-message-in-flight.
+Idempotent: a second C<confirm_select> on a channel already in confirm mode
+does nothing (the broker numbers publications from the first C<confirm.select>
+and never restarts, so re-sending it would desynchronise the sequence).
+
+Confirm mode is a B<connection profile>. It is only allowed on a publish-only
+connection: C<confirm_select> croaks if the connection has consumed, and
+C<consume> croaks once any channel is in confirm mode. And once any channel is
+in confirm mode, C<send> is only allowed on confirm-mode channels: a
+fire-and-forget publish on another channel could leave a C<basic.return>
+inbound that the next settlement wait would meet on the wrong channel. The
+settlement loop therefore runs B<one active settlement wait per connection>;
+several confirm channels may be used, sequentially.
 
 =head2 send(..., mandatory => 1, settle_timeout => SECONDS)
 
@@ -139,7 +147,11 @@ unexpected frame croaks. Treat a croak like C<timeout>: unknown, discard the
 connection. C<connection.blocked> / C<connection.unblocked> (resource alarms)
 are informational: the wait continues and C<is_blocked> reports the state.
 
-On a channel that is not in confirm mode, C<send> returns C<"sent">.
+On a connection with no confirm-mode channel, C<send> returns C<"sent">.
+
+Acknowledgements with C<multiple> set settle every outstanding publication up
+to C<delivery_tag>, and C<delivery_tag> 0 with C<multiple> means all of them;
+both forms are honoured for C<basic.ack> and C<basic.nack>.
 
 =head2 last_return
 

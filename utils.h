@@ -76,6 +76,8 @@ extern SV *rmqc_last_return(rmqc_t *self);
 
 extern int rmqc_is_blocked(rmqc_t *self);
 
+extern int rmqc_settles(uint64_t tag, uint64_t delivery_tag, int multiple);
+
 extern int rmqc_send_ack(rmqc_t *self, HV *args);
 
 extern int rmqc_close_channel(rmqc_t *self, int channel);

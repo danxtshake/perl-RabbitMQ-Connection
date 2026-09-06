@@ -9,25 +9,33 @@ cd "$(dirname "$0")/.."
 NET=rmqc-test-net; BROKER=rmqc-test-broker; RUNNER_IMG=rmqc-test-runner
 DOCKER_CLI="${DOCKER_CLI:-$(command -v docker)}"
 
-cleanup() { [ -n "${KEEP:-}" ] || { docker rm -f "$BROKER" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }; }
+cleanup() { [ -n "${KEEP:-}" ] || { docker rm -f -v "$BROKER" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }; }
 trap cleanup EXIT
 
 docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
-docker rm -f "$BROKER" >/dev/null 2>&1 || true
+docker rm -f -v "$BROKER" >/dev/null 2>&1 || true
 docker run -d --name "$BROKER" --network "$NET" \
   -e RABBITMQ_DEFAULT_USER=test -e RABBITMQ_DEFAULT_PASS=test \
   rabbitmq:3-management-alpine >/dev/null
 docker build -q -t "$RUNNER_IMG" -f xt/Dockerfile.test xt >/dev/null
 
+# Every exec into the broker runs as the rabbitmq user. As root, rabbitmq-diagnostics /
+# rabbitmqctl issued before the server has written its Erlang cookie CREATE that cookie
+# root-owned, and the server then dies with "reading .erlang.cookie: eacces".
 echo "waiting for the broker"
 for i in $(seq 1 60); do
-  docker exec "$BROKER" rabbitmq-diagnostics -q check_running >/dev/null 2>&1 && break; sleep 2
+  docker exec -u rabbitmq "$BROKER" rabbitmq-diagnostics -q check_running >/dev/null 2>&1 && break
+  # a broker that died at startup (seen once: erlang cookie EACCES) must fail the run,
+  # not let the tests execute against nothing
+  [ "$(docker inspect -f '{{.State.Running}}' "$BROKER" 2>/dev/null)" = "true" ] || { docker logs "$BROKER" 2>&1 | tail -5; echo "broker exited during startup"; exit 1; }
+  sleep 2
 done
+docker exec -u rabbitmq "$BROKER" rabbitmq-diagnostics -q check_running >/dev/null 2>&1 || { echo "broker not ready after 120s"; exit 1; }
 
 docker run --rm --network "$NET" \
   -v "$PWD:/src" -w /src \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$DOCKER_CLI:/usr/local/bin/docker:ro" \
   -e TEST_HOST="$BROKER" -e TEST_PORT=5672 -e TEST_USER=test -e TEST_PASS=test \
-  -e TEST_CTL="docker exec $BROKER rabbitmqctl" \
-  "$RUNNER_IMG" sh -c 'perl Makefile.PL >/dev/null && make >/dev/null && make test TEST_VERBOSE=1'
+  -e TEST_CTL="docker exec -u rabbitmq $BROKER rabbitmqctl" \
+  "$RUNNER_IMG" sh -c 'rm -rf blib Makefile Makefile.old pm_to_blib Connection.c Connection.bs *.o; perl Makefile.PL >/dev/null && make >/dev/null && make test TEST_VERBOSE=1'

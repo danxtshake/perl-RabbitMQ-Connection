@@ -24,6 +24,7 @@
 
 static int channel_exists(rmqc_t *self, int channel);
 static int channel_index(rmqc_t *self, int channel);
+static int any_confirm_channel(rmqc_t *self);
 static const char *wait_settlement(rmqc_t *self, int channel, uint64_t tag, int timeout_s);
 static void record_return(rmqc_t *self, amqp_basic_return_t *r, size_t body_len);
 static void clear_return(rmqc_t *self);
@@ -412,6 +413,11 @@ rmqc_send(rmqc_t *self, HV *args)
     }
 
     idx = channel_index(self, channel);
+    /* Once any channel confirms, the whole connection is a confirm connection:
+     * a fire-and-forget publish alongside it could leave a basic.return inbound
+     * that the next settlement wait would meet on the wrong channel. */
+    if(any_confirm_channel(self) && !(idx >= 0 && self->confirm_mode[idx]))
+        croak("send refused: this connection is in publisher-confirm mode; publish on a confirm channel (channel %d is not)\n", channel);
     if(idx >= 0 && self->confirm_mode[idx]) {
         if(fetch_int(args, "settle_timeout", &settle_timeout) != RMQC_OK || settle_timeout <= 0)
             settle_timeout = DEFAULT_SETTLE_TIMEOUT;
@@ -455,14 +461,35 @@ rmqc_confirm_select(rmqc_t *self, HV *args)
         store_channel(self, channel);
     }
 
+    /* Idempotent. The broker numbers publications from the FIRST confirm.select
+     * on a channel and does not restart on a second one, so sending it again
+     * and resetting our sequence would desynchronise the two. */
+    idx = channel_index(self, channel);
+    if(self->confirm_mode[idx])
+        return RMQC_OK;
+
     amqp_confirm_select(self->con, channel);
     croak_on_amqp_error(amqp_get_rpc_reply(self->con), "confirm select");
 
-    idx = channel_index(self, channel);
     self->confirm_mode[idx] = 1;
     self->next_tag[idx] = 0;
 
     return RMQC_OK;
+}
+
+/*
+ * Does an ack/nack with (delivery_tag, multiple) settle publication `tag`?
+ * AMQP: multiple=1 covers every outstanding tag up to delivery_tag, and
+ * delivery_tag=0 with multiple=1 means "all outstanding".
+ */
+extern int
+rmqc_settles(uint64_t tag, uint64_t delivery_tag, int multiple)
+{
+    if(delivery_tag == tag)
+        return 1;
+    if(multiple && (delivery_tag == 0 || delivery_tag >= tag))
+        return 1;
+    return 0;
 }
 
 /*
@@ -511,7 +538,7 @@ wait_settlement(rmqc_t *self, int channel, uint64_t tag, int timeout_s)
             amqp_basic_ack_t *a = (amqp_basic_ack_t *) frame.payload.method.decoded;
             if(frame.channel != channel)
                 croak("settlement wait: basic.ack on unexpected channel %d\n", (int) frame.channel);
-            if(a->delivery_tag == tag || (a->multiple && a->delivery_tag >= tag))
+            if(rmqc_settles(tag, a->delivery_tag, a->multiple))
                 return returned ? "returned" : "ack";
             /* An ack for an older tag cannot be ours; keep waiting. */
             break;
@@ -520,7 +547,7 @@ wait_settlement(rmqc_t *self, int channel, uint64_t tag, int timeout_s)
             amqp_basic_nack_t *n = (amqp_basic_nack_t *) frame.payload.method.decoded;
             if(frame.channel != channel)
                 croak("settlement wait: basic.nack on unexpected channel %d\n", (int) frame.channel);
-            if(n->delivery_tag == tag || (n->multiple && n->delivery_tag >= tag))
+            if(rmqc_settles(tag, n->delivery_tag, n->multiple))
                 return "nack";
             break;
         }
@@ -819,6 +846,18 @@ channel_exists(rmqc_t *self, int channel)
 
     for(i = 0; i < self->num_channels; i++)
         if(channel == self->channels[i])
+            return 1;
+
+    return 0;
+}
+
+static int
+any_confirm_channel(rmqc_t *self)
+{
+    int i;
+
+    for(i = 0; i < self->num_channels; i++)
+        if(self->confirm_mode[i])
             return 1;
 
     return 0;

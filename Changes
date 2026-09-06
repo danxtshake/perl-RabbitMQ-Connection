@@ -7,7 +7,13 @@ Revision history for RabbitMQ::Connection
     - mandatory publications are settled correctly: basic.return followed by
       basic.ack reports "returned", never "ack"; last_return exposes the
       return's reply code/text, exchange, routing key and body length.
-    - Confirm sequence numbers are tracked per channel.
+    - Confirm sequence numbers are tracked per channel; confirm_select is
+      idempotent (never re-sent, never resets the sequence).
+    - Confirm mode is a connection profile: once any channel confirms, send is
+      refused on non-confirm channels (one active settlement wait per
+      connection).
+    - multiple=1 acks/nacks settle every outstanding tag, including the AMQP
+      delivery_tag=0 form.
     - Confirm mode is restricted to publish-only connections, enforced both
       ways: confirm_select refuses after consume, consume refuses after
       confirm_select.
