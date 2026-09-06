@@ -1,0 +1,21 @@
+Revision history for RabbitMQ::Connection
+
+0.9
+    - Publisher confirms: confirm_select(channel => N); send on a confirm-mode
+      channel waits for settlement and returns "ack" | "returned" | "nack" |
+      "timeout" (was: void). Non-confirm send returns "sent".
+    - mandatory publications are settled correctly: basic.return followed by
+      basic.ack reports "returned", never "ack"; last_return exposes the
+      return's reply code/text, exchange, routing key and body length.
+    - Confirm sequence numbers are tracked per channel.
+    - Confirm mode is restricted to publish-only connections, enforced both
+      ways: confirm_select refuses after consume, consume refuses after
+      confirm_select.
+    - connection.blocked / connection.unblocked are handled during settlement
+      waits (is_blocked); channel.close / connection.close from the broker
+      are answered with close-ok and croak.
+    - Test suite against a live broker (t/, TEST_HOST) plus a docker harness
+      (xt/docker-test.sh) covering every settlement outcome.
+
+0.8
+    - Configurable heartbeat.

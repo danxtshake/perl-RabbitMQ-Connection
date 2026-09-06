@@ -50,14 +50,43 @@ _declare_exchange(self, args_ref)
     CODE:
         rmqc_declare_exchange(self, args);
 
-void
+SV *
 _send(self, args_ref)
     RabbitMQ::Connection self
     SV *args_ref
     INIT:
         HV *args = (HV *) SvRV(args_ref);
+        const char *status;
     CODE:
-        rmqc_send(self, args);
+        status = rmqc_send(self, args);
+        RETVAL = newSVpv(status, 0);
+    OUTPUT:
+        RETVAL
+
+void
+_confirm_select(self, args_ref)
+    RabbitMQ::Connection self
+    SV *args_ref
+    INIT:
+        HV *args = (HV *) SvRV(args_ref);
+    CODE:
+        rmqc_confirm_select(self, args);
+
+SV *
+last_return(self)
+    RabbitMQ::Connection self
+    CODE:
+        RETVAL = rmqc_last_return(self);
+    OUTPUT:
+        RETVAL
+
+int
+is_blocked(self)
+    RabbitMQ::Connection self
+    CODE:
+        RETVAL = rmqc_is_blocked(self);
+    OUTPUT:
+        RETVAL
 
 void
 _send_ack(self, args_ref)

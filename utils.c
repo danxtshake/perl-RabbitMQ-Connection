@@ -1,5 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "utils.h"
 
@@ -18,8 +20,13 @@
 
 #define FRAME_MAX    131072
 #define HEARTBEAT    0
+#define DEFAULT_SETTLE_TIMEOUT 10   /* seconds to wait for publisher settlement */
 
 static int channel_exists(rmqc_t *self, int channel);
+static int channel_index(rmqc_t *self, int channel);
+static const char *wait_settlement(rmqc_t *self, int channel, uint64_t tag, int timeout_s);
+static void record_return(rmqc_t *self, amqp_basic_return_t *r, size_t body_len);
+static void clear_return(rmqc_t *self);
 static void store_channel(rmqc_t *self, int channel);
 static void remove_channel(rmqc_t *self, int channel);
 static int fetch_int(HV *h, char *key, int *val);
@@ -127,6 +134,10 @@ rmqc_new(rmqc_t **self, HV *args)
 
     if(((*self)->channels = calloc((*self)->max_channels, sizeof(int))) == NULL)
         croak("could not initialize list of connections\n");
+    if(((*self)->confirm_mode = calloc((*self)->max_channels, sizeof(int))) == NULL)
+        croak("could not initialize channel state\n");
+    if(((*self)->next_tag = calloc((*self)->max_channels, sizeof(uint64_t))) == NULL)
+        croak("could not initialize channel state\n");
 
     return RMQC_OK;
 }
@@ -328,12 +339,31 @@ rmqc_bind(rmqc_t *self, HV *args)
     return RMQC_OK;
 }
 
-extern int
+/*
+ * Publish one message. On a channel in publisher-confirm mode (see
+ * rmqc_confirm_select) this waits for the broker to settle the publication
+ * and returns "ack", "returned", "nack" or "timeout"; on any other channel it
+ * returns "sent" as soon as the frames were written, exactly as before.
+ *
+ * Settlement semantics (one publication in flight per channel):
+ *   "ack"      basic.ack for this publication and no basic.return: the broker
+ *              owns the message and routed it to at least one queue.
+ *   "returned" basic.return arrived (mandatory publication routed nowhere),
+ *              followed by its basic.ack: the broker accepted the publication
+ *              but nothing holds it. Details via rmqc_last_return.
+ *   "nack"     basic.nack: the broker could not take responsibility. With
+ *              several bound queues the message may have reached some of them.
+ *   "timeout"  nothing settled within settle_timeout seconds. The outcome is
+ *              UNKNOWN; the caller must discard this connection.
+ * A channel.close / connection.close from the broker, or a socket error,
+ * croaks (also UNKNOWN for the caller).
+ */
+extern const char *
 rmqc_send(rmqc_t *self, HV *args)
 {
     amqp_bytes_t exchange, routing_key, body;
     char *exchange_name = NULL, *key_name = NULL, *body_str = NULL;
-    int channel, mandatory, immediate, len;
+    int channel, mandatory, immediate, len, idx, settle_timeout;
     amqp_basic_properties_t props;
 
     if(self->con == NULL)
@@ -381,10 +411,217 @@ rmqc_send(rmqc_t *self, HV *args)
         body.len = len;
     }
 
+    idx = channel_index(self, channel);
+    if(idx >= 0 && self->confirm_mode[idx]) {
+        if(fetch_int(args, "settle_timeout", &settle_timeout) != RMQC_OK || settle_timeout <= 0)
+            settle_timeout = DEFAULT_SETTLE_TIMEOUT;
+        clear_return(self);
+        if(amqp_basic_publish(self->con, channel, exchange, routing_key, mandatory, immediate, &props, body))
+            croak("could not send message\n");
+        /* Confirm sequence numbers are per channel and start at 1 after confirm.select. */
+        self->next_tag[idx]++;
+        return wait_settlement(self, channel, self->next_tag[idx], settle_timeout);
+    }
+
     if(amqp_basic_publish(self->con, channel, exchange, routing_key, mandatory, immediate, &props, body))
         croak("could not send message\n");
 
+    return "sent";
+}
+
+/*
+ * Put a channel into publisher-confirm mode (confirm.select). Refused on a
+ * connection that has consumed: settlement frames must never interleave
+ * with deliveries, so confirm mode is for publish-only connections (and,
+ * symmetrically, rmqc_consume refuses once any channel is in confirm mode).
+ */
+extern int
+rmqc_confirm_select(rmqc_t *self, HV *args)
+{
+    int channel, idx;
+
+    if(self->con == NULL)
+        croak("not connected\n");
+
+    if(self->has_consumer)
+        croak("confirm_select refused: this connection consumes; confirm mode requires a publish-only connection\n");
+
+    if(fetch_int(args, "channel", &channel) != RMQC_OK)
+        channel = DEFAULT_CHANNEL;
+
+    if(!channel_exists(self, channel)) {
+        amqp_channel_open(self->con, channel);
+        croak_on_amqp_error(amqp_get_rpc_reply(self->con), "channel open");
+        store_channel(self, channel);
+    }
+
+    amqp_confirm_select(self->con, channel);
+    croak_on_amqp_error(amqp_get_rpc_reply(self->con), "confirm select");
+
+    idx = channel_index(self, channel);
+    self->confirm_mode[idx] = 1;
+    self->next_tag[idx] = 0;
+
     return RMQC_OK;
+}
+
+/*
+ * Wait until the broker settles publication `tag` on `channel`, or the
+ * deadline passes. Reads frames one at a time; anything that is not part of
+ * settlement is either informational (heartbeat, connection.blocked/unblocked)
+ * or fatal (a close from the broker, an unexpected frame).
+ */
+static const char *
+wait_settlement(rmqc_t *self, int channel, uint64_t tag, int timeout_s)
+{
+    struct timespec start, now;
+    struct timeval tv;
+    amqp_frame_t frame;
+    double elapsed, remaining;
+    int returned = 0, st;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for(;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        remaining = timeout_s - elapsed;
+        if(remaining <= 0)
+            return "timeout";
+        tv.tv_sec = (long) remaining;
+        tv.tv_usec = (long) ((remaining - (double) tv.tv_sec) * 1e6);
+
+        /* Frames decoded on the previous iteration are no longer referenced. */
+        amqp_maybe_release_buffers(self->con);
+
+        st = amqp_simple_wait_frame_noblock(self->con, &frame, &tv);
+        if(st == AMQP_STATUS_TIMEOUT)
+            return "timeout";
+        if(st != AMQP_STATUS_OK)
+            croak("settlement wait: %s\n", amqp_error_string2(st));
+
+        if(frame.frame_type == AMQP_FRAME_HEARTBEAT)
+            continue;
+        if(frame.frame_type != AMQP_FRAME_METHOD)
+            croak("settlement wait: unexpected frame type %d on channel %d\n",
+                  (int) frame.frame_type, (int) frame.channel);
+
+        switch(frame.payload.method.id) {
+        case AMQP_BASIC_ACK_METHOD: {
+            amqp_basic_ack_t *a = (amqp_basic_ack_t *) frame.payload.method.decoded;
+            if(frame.channel != channel)
+                croak("settlement wait: basic.ack on unexpected channel %d\n", (int) frame.channel);
+            if(a->delivery_tag == tag || (a->multiple && a->delivery_tag >= tag))
+                return returned ? "returned" : "ack";
+            /* An ack for an older tag cannot be ours; keep waiting. */
+            break;
+        }
+        case AMQP_BASIC_NACK_METHOD: {
+            amqp_basic_nack_t *n = (amqp_basic_nack_t *) frame.payload.method.decoded;
+            if(frame.channel != channel)
+                croak("settlement wait: basic.nack on unexpected channel %d\n", (int) frame.channel);
+            if(n->delivery_tag == tag || (n->multiple && n->delivery_tag >= tag))
+                return "nack";
+            break;
+        }
+        case AMQP_BASIC_RETURN_METHOD: {
+            amqp_basic_return_t *r = (amqp_basic_return_t *) frame.payload.method.decoded;
+            amqp_message_t message;
+            amqp_rpc_reply_t rr;
+            size_t body_len;
+            if(frame.channel != channel)
+                croak("settlement wait: basic.return on unexpected channel %d\n", (int) frame.channel);
+            /* The return carries the whole message back (header + body frames):
+             * drain it so the stream stays in sync, keep only the length. */
+            rr = amqp_read_message(self->con, frame.channel, &message, 0);
+            if(rr.reply_type != AMQP_RESPONSE_NORMAL)
+                croak_on_amqp_error(rr, "read returned message");
+            body_len = message.body.len;
+            amqp_destroy_message(&message);
+            record_return(self, r, body_len);
+            returned = 1;
+            break;
+        }
+        case AMQP_CONNECTION_BLOCKED_METHOD:
+            /* Resource alarm: the broker will stall settlement. Informational;
+             * the deadline decides. */
+            self->blocked = 1;
+            break;
+        case AMQP_CONNECTION_UNBLOCKED_METHOD:
+            self->blocked = 0;
+            break;
+        case AMQP_CHANNEL_CLOSE_METHOD: {
+            amqp_channel_close_t *m = (amqp_channel_close_t *) frame.payload.method.decoded;
+            amqp_channel_close_ok_t ok;
+            int code = m->reply_code;
+            char text[256];
+            snprintf(text, sizeof(text), "%.*s", (int) m->reply_text.len, (char *) m->reply_text.bytes);
+            amqp_send_method(self->con, frame.channel, AMQP_CHANNEL_CLOSE_OK_METHOD, &ok);
+            remove_channel(self, frame.channel);
+            croak("settlement wait: server channel error %d, message: %s\n", code, text);
+        }
+        case AMQP_CONNECTION_CLOSE_METHOD: {
+            amqp_connection_close_t *m = (amqp_connection_close_t *) frame.payload.method.decoded;
+            amqp_connection_close_ok_t ok;
+            int code = m->reply_code;
+            char text[256];
+            snprintf(text, sizeof(text), "%.*s", (int) m->reply_text.len, (char *) m->reply_text.bytes);
+            amqp_send_method(self->con, 0, AMQP_CONNECTION_CLOSE_OK_METHOD, &ok);
+            croak("settlement wait: server connection error %d, message: %s\n", code, text);
+        }
+        default:
+            croak("settlement wait: unexpected method 0x%08X on channel %d\n",
+                  (unsigned) frame.payload.method.id, (int) frame.channel);
+        }
+    }
+}
+
+static void
+clear_return(rmqc_t *self)
+{
+    free(self->last_return.reply_text);
+    free(self->last_return.exchange);
+    free(self->last_return.routing_key);
+    memset(&self->last_return, 0, sizeof(self->last_return));
+}
+
+static void
+record_return(rmqc_t *self, amqp_basic_return_t *r, size_t body_len)
+{
+    clear_return(self);
+    self->last_return.present = 1;
+    self->last_return.reply_code = r->reply_code;
+    self->last_return.reply_text = strndup((char *) r->reply_text.bytes, r->reply_text.len);
+    self->last_return.exchange = strndup((char *) r->exchange.bytes, r->exchange.len);
+    self->last_return.routing_key = strndup((char *) r->routing_key.bytes, r->routing_key.len);
+    self->last_return.body_len = body_len;
+}
+
+/*
+ * The basic.return of the most recent confirm-mode publication on this
+ * connection, or undef. Never contains the body: only its length.
+ */
+extern SV *
+rmqc_last_return(rmqc_t *self)
+{
+    HV *out;
+
+    if(!self->last_return.present)
+        return &PL_sv_undef;
+
+    out = newHV();
+    hv_store(out, "reply_code", strlen("reply_code"), newSViv(self->last_return.reply_code), 0);
+    hv_store(out, "reply_text", strlen("reply_text"), newSVpv(self->last_return.reply_text, 0), 0);
+    hv_store(out, "exchange", strlen("exchange"), newSVpv(self->last_return.exchange, 0), 0);
+    hv_store(out, "routing_key", strlen("routing_key"), newSVpv(self->last_return.routing_key, 0), 0);
+    hv_store(out, "body_len", strlen("body_len"), newSVuv(self->last_return.body_len), 0);
+    return newRV_noinc((SV *) out);
+}
+
+extern int
+rmqc_is_blocked(rmqc_t *self)
+{
+    return self->blocked;
 }
 
 extern int
@@ -419,10 +656,15 @@ rmqc_consume(rmqc_t *self, HV *args)
 {
     amqp_bytes_t queue, consumer_tag;
     char *queue_name = NULL, *tag_name = NULL;
-    int channel, no_local, no_ack, exclusive, len;
+    int channel, no_local, no_ack, exclusive, len, i;
 
     if(self->con == NULL)
         croak("not connected\n");
+
+    for(i = 0; i < self->num_channels; i++)
+        if(self->confirm_mode[i])
+            croak("consume refused: channel %d is in publisher-confirm mode; confirm mode requires a publish-only connection\n",
+                  self->channels[i]);
 
     if(fetch_int(args, "channel", &channel) != RMQC_OK)
         channel = DEFAULT_CHANNEL;
@@ -461,6 +703,7 @@ rmqc_consume(rmqc_t *self, HV *args)
     amqp_basic_consume(self->con, channel, queue, consumer_tag, no_local,
                        no_ack, exclusive, amqp_empty_table);
     croak_on_amqp_error(amqp_get_rpc_reply(self->con), "consume");
+    self->has_consumer = 1;
 
     return RMQC_OK;
 }
@@ -558,6 +801,9 @@ rmqc_destroy(rmqc_t *self)
         free(self->vhost);
         free(self->channels);
         self->channels = NULL;
+        free(self->confirm_mode);
+        free(self->next_tag);
+        clear_return(self);
         if(self->cacert)
             free(self->cacert);
         free(self);
@@ -578,6 +824,18 @@ channel_exists(rmqc_t *self, int channel)
     return 0;
 }
 
+static int
+channel_index(rmqc_t *self, int channel)
+{
+    int i;
+
+    for(i = 0; i < self->num_channels; i++)
+        if(channel == self->channels[i])
+            return i;
+
+    return -1;
+}
+
 static void
 store_channel(rmqc_t *self, int channel)
 {
@@ -587,6 +845,8 @@ store_channel(rmqc_t *self, int channel)
     if(self->num_channels == self->max_channels)
         croak("max configured channels of %d exceeded\n", self->max_channels);
 
+    self->confirm_mode[self->num_channels] = 0;
+    self->next_tag[self->num_channels] = 0;
     self->channels[self->num_channels++] = channel;
 }
 
@@ -603,9 +863,11 @@ remove_channel(rmqc_t *self, int channel)
             break;
     }
 
-    /* Shift all channels after i one place to the left. */
+    /* Shift all channels after i one place to the left, with their state. */
     for(j = i + 1; j < self->num_channels; i++, j++) {
         self->channels[i] = self->channels[j];
+        self->confirm_mode[i] = self->confirm_mode[j];
+        self->next_tag[i] = self->next_tag[j];
     }
 
     self->num_channels--;
