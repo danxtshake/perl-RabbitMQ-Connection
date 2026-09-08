@@ -520,12 +520,12 @@ extern SV
 extern int
 rmqc_close(rmqc_t *self)
 {
-    int i;
-
     if(self && self->con) {
-        for(i = 0; i < self->num_channels; i++) {
-            rmqc_close_channel(self, self->channels[i]);
-        }
+        /* rmqc_close_channel removes the channel from the list, so iterate
+         * from the end: indexing forwards skips every channel that shifts
+         * down into a position already passed, leaving them in channels[]. */
+        while(self->num_channels > 0)
+            rmqc_close_channel(self, self->channels[self->num_channels - 1]);
 
         croak_on_amqp_error(amqp_connection_close(self->con, AMQP_REPLY_SUCCESS), "close");
         amqp_destroy_connection(self->con);
