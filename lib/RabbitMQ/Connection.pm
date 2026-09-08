@@ -114,7 +114,10 @@ in confirm mode.
 
 A C<timeout>, or a croak from a broker close or protocol failure, leaves the
 connection unusable: the outcome is unknown and settlement frames may still be
-in flight. A further confirmed C<send> is refused; discard the connection.
+in flight. A further confirmed C<send> is refused. Discard the object; calling
+C<close> and C<connect> on it does not clear that state.
+
+A connection closed cleanly may be reconnected and reused.
 
 C<send> on a connection that uses no publisher confirms returns nothing, as
 before.
