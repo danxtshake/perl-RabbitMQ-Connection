@@ -1,0 +1,13 @@
+Revision history for RabbitMQ::Connection
+
+0.9
+    - Add publisher confirms with confirm_select().
+    - Confirmed send() reports ack, returned, nack, or timeout.
+    - Handle mandatory unroutable publications correctly: basic.return
+      followed by basic.ack reports returned.
+    - Publisher-confirm connections are publish-only; a timeout or protocol
+      failure leaves the settlement state unknown, and the connection must be
+      discarded.
+
+0.8
+    - Configurable heartbeat.

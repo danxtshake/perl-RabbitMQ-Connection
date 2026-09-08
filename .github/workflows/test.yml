@@ -1,0 +1,16 @@
+# Build the XS module and run the publisher-confirm tests against a throwaway
+# RabbitMQ. All broker setup lives in xt/docker-test.sh, which is also how the
+# suite is run locally; CI runs that one command unchanged.
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: xt/docker-test.sh

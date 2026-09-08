@@ -1,0 +1,7 @@
+# Build-and-test image for RabbitMQ::Connection: the Debian librabbitmq the
+# module is built against in its consumers, plus the Perl toolchain.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential perl librabbitmq-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src

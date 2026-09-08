@@ -56,8 +56,30 @@ _send(self, args_ref)
     SV *args_ref
     INIT:
         HV *args = (HV *) SvRV(args_ref);
+        const char *status;
+    PPCODE:
+        /* A confirmed publish yields a settlement result; an ordinary publish
+         * returns nothing, as it did before publisher confirms were added. */
+        status = rmqc_send(self, args);
+        if(status != NULL)
+            XPUSHs(sv_2mortal(newSVpv(status, 0)));
+
+void
+_confirm_select(self, args_ref)
+    RabbitMQ::Connection self
+    SV *args_ref
+    INIT:
+        HV *args = (HV *) SvRV(args_ref);
     CODE:
-        rmqc_send(self, args);
+        rmqc_confirm_select(self, args);
+
+SV *
+last_return(self)
+    RabbitMQ::Connection self
+    CODE:
+        RETVAL = rmqc_last_return(self);
+    OUTPUT:
+        RETVAL
 
 void
 _send_ack(self, args_ref)

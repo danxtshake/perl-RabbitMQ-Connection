@@ -12,3 +12,13 @@ typemap
 utils.c
 utils.h
 utils.o
+Changes
+t/lib/RmqcTest.pm
+t/10-confirm-ack.t
+t/11-confirm-return.t
+t/12-confirm-nack.t
+t/13-confirm-unknown.t
+t/14-exclusion.t
+t/15-nonexistent-exchange.t
+xt/Dockerfile.test
+xt/docker-test.sh
