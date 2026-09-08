@@ -574,8 +574,12 @@ wait_settlement(rmqc_t *self, int channel, uint64_t tag, int timeout_s)
         }
         case AMQP_CONNECTION_BLOCKED_METHOD:
         case AMQP_CONNECTION_UNBLOCKED_METHOD:
-            /* Resource alarms arrive at any time and are not a settlement:
-             * keep waiting rather than treating them as an unexpected frame. */
+            /* Resource alarms are not a settlement: keep waiting rather than
+             * treating them as an unexpected frame. Defensive only, and not
+             * exercised by the test suite: rabbitmq-c 0.11 does not advertise
+             * the connection.blocked capability, so the broker never sends
+             * these to this client. Kept so that a library version which does
+             * advertise it tolerates an alarm instead of failing the publish. */
             break;
         case AMQP_CHANNEL_CLOSE_METHOD: {
             amqp_channel_close_t *m = (amqp_channel_close_t *) frame.payload.method.decoded;
@@ -794,6 +798,19 @@ rmqc_close(rmqc_t *self)
         croak_on_amqp_error(amqp_connection_close(self->con, AMQP_REPLY_SUCCESS), "close");
         amqp_destroy_connection(self->con);
         self->con = NULL;
+
+        /* Connection-lifetime state, reset only on a successful close so that
+         * reconnecting this object starts clean. Per-channel state is not
+         * reset here: store_channel initialises each position when a channel
+         * is reopened.
+         *
+         * unusable is deliberately NOT reset. An indeterminate confirmed
+         * publication is terminal for the object: reconnecting must not
+         * rehabilitate it, or "discard the connection" would stop meaning
+         * anything. It is only ever clear here anyway, since a clean
+         * lifecycle settles every publication. */
+        self->has_consumer = 0;
+        clear_return(self);
     }
 
     return RMQC_OK;

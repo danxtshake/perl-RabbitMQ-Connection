@@ -20,5 +20,7 @@ t/12-confirm-nack.t
 t/13-confirm-unknown.t
 t/14-exclusion.t
 t/15-nonexistent-exchange.t
+t/16-lifecycle.t
+t/17-channel-shift.t
 xt/Dockerfile.test
 xt/docker-test.sh

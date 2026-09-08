@@ -2,6 +2,8 @@ Revision history for RabbitMQ::Connection
 
 0.9
     - Add publisher confirms with confirm_select().
+    - A successful close() resets connection-lifetime state, so a cleanly
+      closed object can be reconnected.
     - Confirmed send() reports ack, returned, nack, or timeout.
     - Handle mandatory unroutable publications correctly: basic.return
       followed by basic.ack reports returned.
