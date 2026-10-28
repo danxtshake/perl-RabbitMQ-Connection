@@ -91,6 +91,15 @@ _send_ack(self, args_ref)
         rmqc_send_ack(self, args);
 
 void
+_reject(self, args_ref)
+    RabbitMQ::Connection self
+    SV *args_ref
+    INIT:
+        HV *args = (HV *) SvRV(args_ref);
+    CODE:
+        rmqc_reject(self, args);
+
+void
 _bind(self, args_ref)
     RabbitMQ::Connection self
     SV *args_ref

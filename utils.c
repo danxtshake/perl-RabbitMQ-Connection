@@ -17,6 +17,8 @@
 #define DEFAULT_EXCLUSIVE 0
 #define DEFAULT_NO_ACK    1
 #define DEFAULT_EXCH_TYPE "direct"
+#define DEFAULT_CONTENT_TYPE "text/plain"
+#define DEFAULT_REQUEUE   1         /* basic.reject's protocol default */
 
 #define FRAME_MAX    131072
 #define HEARTBEAT    0
@@ -34,6 +36,8 @@ static void remove_channel(rmqc_t *self, int channel);
 static int fetch_int(HV *h, char *key, int *val);
 static int fetch_uint(HV *h, char *key, unsigned long *val);
 static int fetch_str(HV *h, char *key, char **val, int *len);
+static int fetch_opt_str(HV *h, char *key, char **val, int *len);
+static amqp_table_entry_t *fetch_table(HV *h, char *key, const char *context, amqp_table_t *table);
 static void croak_on_amqp_error(amqp_rpc_reply_t x, char const *context);
 
 extern int
@@ -253,6 +257,9 @@ extern char
 *rmqc_declare_queue(rmqc_t *self, HV *args)
 {
     amqp_bytes_t queue;
+    amqp_table_t arguments;
+    amqp_table_entry_t *entries;
+    amqp_rpc_reply_t reply;
     char *queue_name = NULL;
     int channel, passive, durable, exclusive, auto_delete, len;
 
@@ -285,9 +292,15 @@ extern char
         queue.len = len;
     }
 
+    /* Built last: nothing between here and the free below can croak. */
+    entries = fetch_table(args, "arguments", "declare queue", &arguments);
     amqp_queue_declare(self->con, channel, queue, passive, durable, exclusive,
-                       auto_delete, amqp_empty_table);
-    croak_on_amqp_error(amqp_get_rpc_reply(self->con), "declare queue");
+                       auto_delete, arguments);
+    /* The entries only point into the caller's hash; the table was encoded
+     * when the method was sent, so they can go before a possible croak. */
+    reply = amqp_get_rpc_reply(self->con);
+    free(entries);
+    croak_on_amqp_error(reply, "declare queue");
 
     return queue.bytes;
 }
@@ -352,15 +365,28 @@ rmqc_send(rmqc_t *self, HV *args)
 {
     amqp_bytes_t exchange, routing_key, body;
     char *exchange_name = NULL, *key_name = NULL, *body_str = NULL;
+    char *content_type = NULL, *message_id = NULL;
     int channel, mandatory, immediate, len, idx, settle_timeout;
     amqp_basic_properties_t props;
 
     if(self->con == NULL)
         croak("not connected\n");
 
+    /* Always persistent with a content type; message_id only when given. */
     props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
-    props.content_type = amqp_cstring_bytes("text/plain");
     props.delivery_mode = 2;
+    if(fetch_opt_str(args, "content_type", &content_type, &len) == RMQC_OK) {
+        props.content_type.bytes = content_type;
+        props.content_type.len = len;
+    }
+    else {
+        props.content_type = amqp_cstring_bytes(DEFAULT_CONTENT_TYPE);
+    }
+    if(fetch_opt_str(args, "message_id", &message_id, &len) == RMQC_OK) {
+        props._flags |= AMQP_BASIC_MESSAGE_ID_FLAG;
+        props.message_id.bytes = message_id;
+        props.message_id.len = len;
+    }
 
     if(fetch_int(args, "channel", &channel) != RMQC_OK)
         channel = DEFAULT_CHANNEL;
@@ -676,6 +702,45 @@ rmqc_send_ack(rmqc_t *self, HV *args)
     return RMQC_OK;
 }
 
+/*
+ * Reject one delivery (basic.reject). requeue 0 discards it, which dead-letters
+ * it through the queue's x-dead-letter-exchange when one is set; requeue 1
+ * puts it back on its queue. A consumer operation, so refused on a
+ * publisher-confirm connection, which never has deliveries.
+ */
+extern int
+rmqc_reject(rmqc_t *self, HV *args)
+{
+    int channel, requeue;
+    unsigned long delivery_tag = 0;
+
+    if(self->con == NULL)
+        croak("not connected\n");
+
+    if(any_confirm_channel(self))
+        croak("reject refused: this connection uses publisher confirms; publisher-confirm connections are publish-only\n");
+
+    if(fetch_uint(args, "delivery_tag", &delivery_tag) != RMQC_OK)
+        croak("reject: delivery_tag is required\n");
+
+    if(fetch_int(args, "channel", &channel) != RMQC_OK)
+        channel = DEFAULT_CHANNEL;
+
+    if(!channel_exists(self, channel)) {
+        amqp_channel_open(self->con, channel);
+        croak_on_amqp_error(amqp_get_rpc_reply(self->con), "channel open");
+        store_channel(self, channel);
+    }
+
+    if(fetch_int(args, "requeue", &requeue) != RMQC_OK)
+        requeue = DEFAULT_REQUEUE;
+
+    if(amqp_basic_reject(self->con, channel, delivery_tag, requeue ? 1 : 0))
+        croak("could not send reject for %lu\n", delivery_tag);
+
+    return RMQC_OK;
+}
+
 extern int
 rmqc_consume(rmqc_t *self, HV *args)
 {
@@ -740,7 +805,8 @@ extern SV
     struct timeval *tval_p = NULL, tval;
     amqp_envelope_t envelope;
     amqp_rpc_reply_t ret;
-    HV *out = newHV();
+    amqp_basic_properties_t *p;
+    HV *out = newHV(), *props;
     SV *out_ref = &PL_sv_undef;
 
     if(self->con == NULL)
@@ -769,6 +835,20 @@ extern SV
                  newSVpv(envelope.routing_key.bytes, envelope.routing_key.len), 0);
         hv_store(out, "body", strlen("body"),
                  newSVpv(envelope.message.body.bytes, envelope.message.body.len), 0);
+
+        /* Message properties, each only when the publisher set it. */
+        props = newHV();
+        p = &envelope.message.properties;
+        if(p->_flags & AMQP_BASIC_CONTENT_TYPE_FLAG)
+            hv_store(props, "content_type", strlen("content_type"),
+                     newSVpv(p->content_type.bytes, p->content_type.len), 0);
+        if(p->_flags & AMQP_BASIC_MESSAGE_ID_FLAG)
+            hv_store(props, "message_id", strlen("message_id"),
+                     newSVpv(p->message_id.bytes, p->message_id.len), 0);
+        if(p->_flags & AMQP_BASIC_DELIVERY_MODE_FLAG)
+            hv_store(props, "delivery_mode", strlen("delivery_mode"),
+                     newSViv(p->delivery_mode), 0);
+        hv_store(out, "props", strlen("props"), newRV_noinc((SV *) props), 0);
 
         amqp_destroy_envelope(&envelope);
         out_ref = newRV_noinc((SV *) out);
@@ -969,6 +1049,78 @@ fetch_str(HV *h, char *key, char **val, int *len)
     *len = plen;
 
     return RMQC_OK;
+}
+
+/* As fetch_str, but an undef value counts as not given. */
+static int
+fetch_opt_str(HV *h, char *key, char **val, int *len)
+{
+    SV **v = hv_fetch(h, key, strlen(key), 0);
+
+    if(v == NULL || !SvOK(*v))
+        return RMQC_ERR;
+
+    return fetch_str(h, key, val, len);
+}
+
+/*
+ * Build an AMQP field table from an optional hashref argument. A string value
+ * becomes a longstr; a value that is a Perl integer and not a string becomes a
+ * signed 64-bit integer (x-message-ttl, x-max-length and the like need one).
+ * Anything else croaks. Absent or undef gives the empty table.
+ *
+ * The entries point into the caller's hash, which must outlive their use.
+ * Returns the entries array for the caller to free() (NULL when empty).
+ */
+static amqp_table_entry_t *
+fetch_table(HV *h, char *key, const char *context, amqp_table_t *table)
+{
+    SV **v = hv_fetch(h, key, strlen(key), 0);
+    HV *src;
+    HE *he;
+    amqp_table_entry_t *entries;
+    int n = 0;
+
+    *table = amqp_empty_table;
+    if(v == NULL || !SvOK(*v))
+        return NULL;
+    if(!SvROK(*v) || SvTYPE(SvRV(*v)) != SVt_PVHV)
+        croak("%s: %s must be a hash reference\n", context, key);
+
+    src = (HV *) SvRV(*v);
+    if(HvUSEDKEYS(src) == 0)
+        return NULL;
+    if((entries = calloc(HvUSEDKEYS(src), sizeof(*entries))) == NULL)
+        croak("calloc failed\n");
+
+    hv_iterinit(src);
+    while((he = hv_iternext(src)) != NULL) {
+        SV *val = hv_iterval(src, he);
+        STRLEN klen, vlen;
+        char *k = HePV(he, klen);
+        amqp_table_entry_t *e = &entries[n++];
+
+        e->key.bytes = k;
+        e->key.len = klen;
+        if(SvPOK(val)) {
+            e->value.kind = AMQP_FIELD_KIND_UTF8;
+            e->value.value.bytes.bytes = SvPV(val, vlen);
+            e->value.value.bytes.len = vlen;
+        }
+        else if(SvIOK(val) && !SvROK(val)) {
+            e->value.kind = AMQP_FIELD_KIND_I64;
+            e->value.value.i64 = SvIV(val);
+        }
+        else {
+            free(entries);
+            croak("%s: %s value for '%.*s' must be a string or an integer\n",
+                  context, key, (int) klen, k);
+        }
+    }
+
+    table->num_entries = n;
+    table->entries = entries;
+    return entries;
 }
 
 static void

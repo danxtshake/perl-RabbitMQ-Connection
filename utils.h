@@ -87,6 +87,8 @@ extern SV *rmqc_last_return(rmqc_t *self);
 
 extern int rmqc_send_ack(rmqc_t *self, HV *args);
 
+extern int rmqc_reject(rmqc_t *self, HV *args);
+
 extern int rmqc_close_channel(rmqc_t *self, int channel);
 
 extern int rmqc_close(rmqc_t *self);
