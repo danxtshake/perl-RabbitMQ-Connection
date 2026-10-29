@@ -22,5 +22,7 @@ t/14-exclusion.t
 t/15-nonexistent-exchange.t
 t/16-lifecycle.t
 t/17-channel-shift.t
+t/18-message-props.t
+t/19-reject-dlx.t
 xt/Dockerfile.test
 xt/docker-test.sh

@@ -1,5 +1,17 @@
 Revision history for RabbitMQ::Connection
 
+0.91
+    - send() takes optional content_type (default still text/plain) and
+      message_id; without them a message is published exactly as before.
+    - receive() adds props => { content_type, message_id, delivery_mode },
+      holding the properties the publisher set; existing keys are unchanged.
+    - Add reject(delivery_tag, channel, requeue) (basic.reject). requeue => 0
+      dead-letters through the queue's x-dead-letter-exchange. Refused on a
+      publisher-confirm connection, which is publish-only.
+    - declare_queue() takes an optional arguments hashref (string values as
+      longstr, Perl integers as signed 64-bit). Without it, no arguments are
+      sent, as before.
+
 0.9
     - Add publisher confirms with confirm_select().
     - A successful close() resets connection-lifetime state, so a cleanly
