@@ -120,7 +120,7 @@ rmqc_new(rmqc_t **self, HV *args)
     strncpy((*self)->pass, pass, len + 1);
     (*self)->pass[len] = '\0';
 
-    if(!hv_exists(args, "vhost", strlen("vhost\n\n\n"))) {
+    if(!hv_exists(args, "vhost", strlen("vhost"))) {
         vhost = DEFAULT_VHOST;
         len = strlen(DEFAULT_VHOST);
     }
